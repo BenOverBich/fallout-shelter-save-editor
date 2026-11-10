@@ -78,7 +78,7 @@ console.log(
 console.log(`  item icons: ${JSON.stringify(iconStats)}`);
 
 writeOutput('meta.json', {
-  gameVersion: '2.5.0',
+  gameVersion: '2.7.0',
   unityVersion: '6000.0.58f2',
   generatedAt: new Date().toISOString(),
   counts: {

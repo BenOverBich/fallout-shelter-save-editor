@@ -44,6 +44,32 @@ export const REWARD_TYPES = [
 /** A grantable reward type (excludes the inert `"[Type]"` placeholder). */
 export type RewardType = (typeof REWARD_TYPES)[number];
 
+/**
+ * Editor-only marker on a reward whose static fields were filled in from the catalog
+ * (a v2.7.0+ positional reward - see below). Never written to a file: the export path
+ * strips it together with the filled-in fields (seasonOps.dehydrateSeasonSave).
+ */
+export const HYDRATED_REWARD_MARK = '__fsseHydrated';
+
+/**
+ * The static reward fields a v2.7.0+ `spd.dat` no longer stores. The editor fills them
+ * in from the catalog on load and removes them again on export.
+ */
+export const HYDRATED_REWARD_KEYS = [
+  'id',
+  'isPrestige',
+  'rewardType',
+  'dataValInt',
+  'dataValString',
+  'icon',
+] as const;
+
+// The WORKING shape of a reward. Two on-disk shapes map onto it:
+//   - up to game v2.5.x: every field below is in the file (static data + numeric id).
+//   - game v2.7.0+: the file holds ONLY `claimedList` + `levelRequired`; the reward is
+//     identified by its position in the track and its static data lives in game assets.
+//     seasonOps.loadSeasonSave hydrates those rewards from the catalog (and tags them
+//     with HYDRATED_REWARD_MARK) so ops and UI see one shape either way.
 const rewardSchema = z.looseObject({
   id: z.number(),
   isPrestige: z.boolean(),
@@ -54,6 +80,20 @@ const rewardSchema = z.looseObject({
   // [] = unclaimed; a claimed reward holds the vault index (0 in single-vault saves).
   claimedList: z.array(z.number()),
   levelRequired: z.number(),
+  [HYDRATED_REWARD_MARK]: z.literal(true).optional(),
+});
+
+// The inert per-season `ncqReward` record. Same family of fields, but it never carried an
+// id from v2.7.0 on and newer seasons omit it entirely - the editor only round-trips it.
+const ncqRewardSchema = z.looseObject({
+  id: z.number().optional(),
+  isPrestige: z.boolean().optional(),
+  rewardType: z.string().optional(),
+  dataValInt: z.number().optional(),
+  dataValString: z.string().optional(),
+  icon: z.string().optional(),
+  claimedList: z.array(z.number()).optional(),
+  levelRequired: z.number().optional(),
 });
 
 // --- Per-season record ----------------------------
@@ -71,7 +111,7 @@ const seasonRecordSchema = z.looseObject({
   hasBeenWarnedAboutSeasonEnd: z.boolean().optional(),
   leaderboardData: leaderboardDataSchema.optional(),
   maxRankAchieved: z.number().optional(),
-  ncqReward: rewardSchema.optional(),
+  ncqReward: ncqRewardSchema.optional(),
   freeRewardsList: z.array(rewardSchema).optional(),
   premiumRewardsList: z.array(rewardSchema).optional(),
 });

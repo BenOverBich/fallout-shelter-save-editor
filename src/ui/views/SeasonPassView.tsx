@@ -4,6 +4,7 @@ import { useUIStore } from '../../state/uiStore.ts';
 import { useToastStore } from '../../state/toastStore.ts';
 import { useGameData } from '../hooks/useGameData.ts';
 import { useSeasonCatalog } from '../hooks/useSeasonCatalog.ts';
+import { loadSeasonCatalog } from '../../domain/gamedata/seasonCatalog.ts';
 import type { SeasonReward } from '../../domain/model/seasonSchema.ts';
 import {
   advanceSeasonClock,
@@ -89,7 +90,13 @@ export function SeasonPassView() {
     return (
       <div className="h-full overflow-auto">
         <SeasonOnboarding
-          onUpload={loadSeasonFromText}
+          onUpload={async (spdText, nvfText, fileName) => {
+            // A v2.7.0 spd.dat no longer says what its rewards are - the catalog does. Wait
+            // for it if the upload beat the fetch; a failed fetch still loads the file (its
+            // rewards then show as unknown and claim as plain flags).
+            const rewardCatalog = catalog ?? (await loadSeasonCatalog().catch(() => null));
+            await loadSeasonFromText(spdText, nvfText, fileName, rewardCatalog);
+          }}
           onContinue={() => {
             if (catalog) startSeasonFromCatalog(catalog);
           }}

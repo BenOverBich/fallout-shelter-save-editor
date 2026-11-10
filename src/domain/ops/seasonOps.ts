@@ -1,7 +1,14 @@
 import type { SaveData, Item } from '../model/saveSchema.ts';
-import type { NvfData, SeasonReward, SeasonSave } from '../model/seasonSchema.ts';
+import {
+  HYDRATED_REWARD_KEYS,
+  HYDRATED_REWARD_MARK,
+  type NvfData,
+  type SeasonReward,
+  type SeasonSave,
+} from '../model/seasonSchema.ts';
 import type { CatalogReward, Pet, UniqueDwellers } from '../gamedata/schemas.ts';
 import type { SeasonCatalog } from '../gamedata/seasonCatalog.ts';
+import { syntheticRewardId } from '../gamedata/seasonRewardId.ts';
 import { petSpecialName } from '../gamedata/gameData.ts';
 import { grantItems, removeStoredItemAt, addPet, type StackableType } from './storageOps.ts';
 import {
@@ -143,6 +150,11 @@ function withRecord(
  * same-id rewards' claim state in sync across records (confirmed in a real spd.dat: a
  * claim made in NewVegasA_26_07 also appears in the NewVegasA record). Mirroring the
  * flag matches that invariant so exported files agree with what the game would write.
+ * A v2.7.0+ file has no reward ids: its rewards get a synthetic id that is unique per
+ * season record (seasonRewardId.ts), so this touches exactly one reward there - matching
+ * v2.7.0, where a rerun keeps claim state separate from its original (confirmed in a real
+ * v2.7.0 spd.dat: UltraciteFever and UltraciteFever_27_03 share one reward list in the
+ * game assets yet carry different claims).
  * Structural sharing: untouched records/lists keep their references; a no-op returns
  * the same `spd`.
  */
@@ -369,7 +381,11 @@ export const ULTRACITE_SEASON_ID = 'UltraciteFever';
  * inert. Null spd (no season model loaded) is not active.
  */
 export function isUltraciteSeasonActive(spd: SeasonSave | null): boolean {
-  return spd?.currentSeason === ULTRACITE_SEASON_ID;
+  const current = spd?.currentSeason;
+  if (typeof current !== 'string') return false;
+  // Reruns are date-suffixed ("UltraciteFever_27_03") and ship the same ULTRACITE_* feature
+  // flags as the original season (SeasonDataSet assets, v2.7.0).
+  return current === ULTRACITE_SEASON_ID || current.startsWith(`${ULTRACITE_SEASON_ID}_`);
 }
 
 // --- claim / unclaim ---------------------------------------------------
@@ -779,9 +795,38 @@ export function switchSeason(ws: SeasonWorkspace, seasonId: string): SeasonWorks
 
 // --- fresh model construction ("Continue without a file") -------------
 
-/** A reward laid out by the catalog gains a fresh, empty `claimedList`. */
+/**
+ * A reward laid out by the catalog: the per-save fields first (the only ones a v2.7.0 file
+ * stores), then the catalog's static data, tagged as hydrated so the export writes the
+ * game's own v2.7.0 shape (see {@link dehydrateSeasonSave}).
+ */
 function freshReward(reward: CatalogReward): SeasonReward {
-  return { ...reward, claimedList: [] };
+  const { levelRequired, ...staticData } = reward;
+  return { claimedList: [], levelRequired, ...staticData, [HYDRATED_REWARD_MARK]: true };
+}
+
+/** "YYYY-MM-DD" → local-midnight epoch ms (the game compares season dates in local time). */
+function localDateMs(date: string | undefined): number | null {
+  const m = date?.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime() : null;
+}
+
+/**
+ * The season a fresh model should treat as active at `nowMs`: the one whose scheduled
+ * window contains now, else the most recent one that has already started, else the last
+ * catalog season (catalogs without dates). The catalog can list seasons that have not
+ * started yet (v2.7.0 ships UltraciteFever_27_03 months ahead), so "last" alone is wrong.
+ */
+export function defaultSeasonId(catalog: SeasonCatalog, nowMs: number = Date.now()): string {
+  let started: string | null = null;
+  for (const entry of catalog.seasons) {
+    const start = localDateMs(entry.startDate);
+    if (start === null || start > nowMs) continue;
+    started = entry.id; // catalog order is chronological
+    const end = localDateMs(entry.endDate);
+    if (end !== null && nowMs < end + 86_400_000) return entry.id;
+  }
+  return started ?? catalog.seasonIds[catalog.seasonIds.length - 1] ?? '';
 }
 
 /** The empty 4×5 leaderboard claim grid, stringified the way the game stores it. */
@@ -794,8 +839,11 @@ const EMPTY_LEADERBOARD_GRID = JSON.stringify(
  * claimed, level 1, no premium). The active season defaults to the most recent catalog
  * season. Reward ids/codes are taken verbatim from the catalog - never regenerated.
  */
-export function buildFreshSeasonSave(catalog: SeasonCatalog): SeasonSave {
-  const currentSeason = catalog.seasonIds[catalog.seasonIds.length - 1] ?? '';
+export function buildFreshSeasonSave(
+  catalog: SeasonCatalog,
+  nowMs: number = Date.now(),
+): SeasonSave {
+  const currentSeason = defaultSeasonId(catalog, nowMs);
   const seasonsData: NonNullable<SeasonSave['seasonsData']> = {};
   for (const entry of catalog.seasons) {
     seasonsData[entry.id] = {
@@ -809,7 +857,8 @@ export function buildFreshSeasonSave(catalog: SeasonCatalog): SeasonSave {
         lastRewardLevelUnlocked: -1,
       },
       maxRankAchieved: 0,
-      ...(catalog.ncqReward ? { ncqReward: freshReward(catalog.ncqReward) } : {}),
+      // Pre-v2.7.0 catalogs carry the inert ncqReward placeholder; v2.7.0 has none.
+      ...(catalog.ncqReward ? { ncqReward: { ...catalog.ncqReward, claimedList: [] } } : {}),
       freeRewardsList: entry.freeRewards.map(freshReward),
       premiumRewardsList: entry.premiumRewards.map(freshReward),
     };
@@ -830,38 +879,138 @@ export function buildFreshSeasonSave(catalog: SeasonCatalog): SeasonSave {
 }
 
 /** Build a fresh `nvf.dat` pointer for the catalog's default active season. */
-export function buildFreshNvf(catalog: SeasonCatalog): NvfData {
-  return { season: { id: catalog.seasonIds[catalog.seasonIds.length - 1] ?? '', type: 0 } };
+export function buildFreshNvf(catalog: SeasonCatalog, nowMs: number = Date.now()): NvfData {
+  return { season: { id: defaultSeasonId(catalog, nowMs), type: 0 } };
+}
+
+/** Static data for a positional reward the catalog cannot describe (unknown season, or a
+ *  layout that no longer lines up): inert, so a claim is a pure flag flip. */
+const UNKNOWN_REWARD_DATA = {
+  isPrestige: false,
+  rewardType: '[Type]',
+  dataValInt: 0,
+  dataValString: '[Data]',
+  icon: '[Icon]',
+} as const;
+
+/**
+ * Fill in a v2.7.0 positional reward (file shape: `claimedList` + `levelRequired` only)
+ * from the catalog entry at the same (season, track, index). The file's own keys stay
+ * first and untouched; the catalog fields and the editor-only mark are appended, so
+ * {@link dehydrateSeasonSave} can restore the exact on-disk shape. A catalog entry is only
+ * trusted when its level gate matches the file's - a mismatch means the game's reward
+ * layout moved on from this catalog, and guessing would grant the wrong item.
+ */
+function hydrateReward(
+  reward: SeasonReward,
+  catalog: SeasonCatalog | null,
+  seasonId: string,
+  track: SeasonTrack,
+  index: number,
+): SeasonReward {
+  const entry = catalog?.seasonById.get(seasonId);
+  const candidate = (track === 'free' ? entry?.freeRewards : entry?.premiumRewards)?.[index];
+  const match = candidate && candidate.levelRequired === reward.levelRequired ? candidate : null;
+  return {
+    ...reward,
+    id: match?.id ?? syntheticRewardId(seasonId, track, index),
+    isPrestige: match?.isPrestige ?? UNKNOWN_REWARD_DATA.isPrestige,
+    rewardType: match?.rewardType ?? UNKNOWN_REWARD_DATA.rewardType,
+    dataValInt: match?.dataValInt ?? UNKNOWN_REWARD_DATA.dataValInt,
+    dataValString: match?.dataValString ?? UNKNOWN_REWARD_DATA.dataValString,
+    icon: match?.icon ?? UNKNOWN_REWARD_DATA.icon,
+    [HYDRATED_REWARD_MARK]: true,
+  };
+}
+
+/** True for a reward in the v2.7.0 on-disk shape (no static data in the file). */
+function isPositionalReward(reward: SeasonReward): boolean {
+  return typeof (reward as { rewardType?: unknown }).rewardType !== 'string';
 }
 
 /**
- * Normalize an uploaded `spd.dat` into a working model: defensively guarantee every reward
- * carries a `claimedList` array so the board never reads `undefined`. Pass-through for the
- * rest (the loose schema already preserves unknown keys for round-trip).
+ * Normalize an uploaded `spd.dat` into a working model:
+ *   - defensively guarantee every reward carries a `claimedList` array so the board never
+ *     reads `undefined`;
+ *   - hydrate v2.7.0 positional rewards from the catalog (see {@link hydrateReward}), so
+ *     ops and UI see the same reward shape for every game version.
+ * Pass-through for the rest (the loose schema already preserves unknown keys for
+ * round-trip). Pre-v2.7.0 files, whose rewards carry their own data, are left as they are.
  */
-export function loadSeasonSave(spd: SeasonSave): SeasonSave {
+export function loadSeasonSave(spd: SeasonSave, catalog: SeasonCatalog | null = null): SeasonSave {
   const seasonsData = spd.seasonsData;
   if (!seasonsData) return spd;
   let changed = false;
   const nextData: NonNullable<SeasonSave['seasonsData']> = {};
   for (const [seasonId, record] of Object.entries(seasonsData)) {
     let recordChanged = false;
-    const fix = (list: SeasonReward[] | undefined): SeasonReward[] | undefined => {
+    const fix = (
+      list: SeasonReward[] | undefined,
+      track: SeasonTrack,
+    ): SeasonReward[] | undefined => {
       if (!Array.isArray(list)) return list;
       let listChanged = false;
-      const next = list.map((r) => {
-        if (Array.isArray(r.claimedList)) return r;
-        listChanged = true;
-        return { ...r, claimedList: [] };
+      const next = list.map((r, index) => {
+        const withClaims = Array.isArray(r.claimedList) ? r : { ...r, claimedList: [] };
+        const fixed = isPositionalReward(withClaims)
+          ? hydrateReward(withClaims, catalog, seasonId, track, index)
+          : withClaims;
+        if (fixed !== r) listChanged = true;
+        return fixed;
       });
       if (listChanged) recordChanged = true;
       return listChanged ? next : list;
     };
-    const free = fix(record.freeRewardsList);
-    const premium = fix(record.premiumRewardsList);
+    const free = fix(record.freeRewardsList, 'free');
+    const premium = fix(record.premiumRewardsList, 'premium');
     if (recordChanged) {
       changed = true;
       nextData[seasonId] = { ...record, freeRewardsList: free, premiumRewardsList: premium };
+    } else {
+      nextData[seasonId] = record;
+    }
+  }
+  return changed ? { ...spd, seasonsData: nextData } : spd;
+}
+
+/**
+ * The on-disk form of the working model: every hydrated reward (v2.7.0 positional, or
+ * laid out fresh from the catalog) drops the catalog-filled static fields and the
+ * editor-only mark again, leaving exactly the keys the v2.7.0 game writes (`claimedList`,
+ * `levelRequired`, plus anything unknown the file carried). Rewards that came from a
+ * pre-v2.7.0 file are not marked and keep their own data. Returns the same `spd` when
+ * nothing is hydrated.
+ */
+export function dehydrateSeasonSave(spd: SeasonSave): SeasonSave {
+  const seasonsData = spd.seasonsData;
+  if (!seasonsData) return spd;
+  const stripped = new Set<string>([...HYDRATED_REWARD_KEYS, HYDRATED_REWARD_MARK]);
+  let changed = false;
+  const nextData: NonNullable<SeasonSave['seasonsData']> = {};
+  for (const [seasonId, record] of Object.entries(seasonsData)) {
+    let recordChanged = false;
+    const strip = (list: SeasonReward[] | undefined): SeasonReward[] | undefined => {
+      if (!Array.isArray(list)) return list;
+      let listChanged = false;
+      const next = list.map((r) => {
+        if (r[HYDRATED_REWARD_MARK] !== true) return r;
+        listChanged = true;
+        return Object.fromEntries(
+          Object.entries(r).filter(([key]) => !stripped.has(key)),
+        ) as SeasonReward;
+      });
+      if (listChanged) recordChanged = true;
+      return listChanged ? next : list;
+    };
+    const free = strip(record.freeRewardsList);
+    const premium = strip(record.premiumRewardsList);
+    if (recordChanged) {
+      changed = true;
+      nextData[seasonId] = {
+        ...record,
+        ...(free !== undefined ? { freeRewardsList: free } : {}),
+        ...(premium !== undefined ? { premiumRewardsList: premium } : {}),
+      };
     } else {
       nextData[seasonId] = record;
     }

@@ -1,64 +1,66 @@
 // season-pass.json - the static Season Pass reward catalog.
 //
-// Enables the Season tab's "Continue without a file" path: a fresh, fully-editable
-// `spd.dat` working model is built purely from this catalog (no user file). It is the
-// per-season reward layout (free + premium tracks, level gates, item codes) with the
-// per-SAVE claim state stripped out - `claimedList` is omitted here because it is save
-// state, not catalog; the fresh-model builder (seasonOps) attaches `[]`.
+// Two jobs in the app:
+//   1. "Continue without a file": a fresh, fully-editable `spd.dat` working model is built
+//      purely from this catalog (no user file).
+//   2. Hydrating a v2.7.0+ `spd.dat`: from game v2.7.0 the file only stores per-save state
+//      for each reward (`claimedList`, `levelRequired`); what the reward IS (type, item,
+//      quantity, icon) comes from this catalog, matched by position in the track.
 //
-// Source: a reference `spd.dat` at the repo root (a real season-pass save, gitignored
-// like every `.dat`/`.sav`). Only the derived season-pass.json is committed; the
-// reference file stays on the curation machine. Re-run via `pnpm gamedata:build` when
-// the game ships new seasons. The reward ids/codes are emitted verbatim - never
-// regenerated.
-import { createDecipheriv } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+// Source (game v2.7.0+): the per-season ScriptableObjects in the AssetRipper export -
+//
+//   Season_<id>.asset              - m_id, m_startDateString, m_endDateString, m_seasonDataSet {guid}
+//   SeasonDataSet_<name>.asset     - m_SeasonPassRewards {guid}, m_tokenRequirements {guid},
+//                                    m_passPurchaseRewardsDefID
+//   SeasonPassRewards_<name>.asset - m_freeRewards / m_premiumRewards: ordered {guid} lists
+//   SeasonPassEntry_<...>.asset    - one reward: m_levelRequired, m_icon, m_isPrestige,
+//                                    m_rewardType, m_data_ValueStr, m_data_ValueInt
+//   SeasonPassTokenRequirements_<name>.asset - m_data (hex-encoded LE int32 array)
+//   SeasonPassPurchaseRewards_<defID>.asset  - m_basePassTokens, m_premiumPassTokens
+//
+// Before v2.7.0 the rewards were copied out of a reference `spd.dat` at the repo root
+// (the save file itself carried the static reward data + a numeric id per reward). That
+// file is no longer needed: v2.7.0 saves do not contain the data, the assets do.
+//
+// Reward ids: v2.7.0 has no reward ids at all (rewards are positional), so each catalog
+// reward gets a deterministic synthetic id from (season, track, index) - see
+// src/domain/gamedata/seasonRewardId.ts, shared with the app so both sides agree.
+import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { PATHS, REPO_ROOT, readSource, writeOutput } from './lib/io.mjs';
-
-// Same fixed game-wide key/IV as the app codec (src/domain/crypto/aesCbc.ts).
-// Duplicated here because the build scripts are plain Node
-// ESM and don't import the app's TS crypto module.
-const KEY = Buffer.from('a7ca9f3366d892c2f0bef417341ca971b69ae9f7bacccffcf43c62d1d7d021f9', 'hex');
-const IV = Buffer.from('7475383967656a693334307438397532', 'hex'); // ASCII "tu89geji340t89u2"
-
-const REFERENCE_SPD = join(REPO_ROOT, 'spd.dat');
-
-/** Decode a Fallout Shelter container file (base64 → AES-256-CBC → UTF-8 → JSON). */
-function decodeContainer(text) {
-  const decipher = createDecipheriv('aes-256-cbc', KEY, IV); // PKCS#7 padding (default)
-  const plain = Buffer.concat([
-    decipher.update(Buffer.from(text.trim(), 'base64')),
-    decipher.final(),
-  ]);
-  // The catalog carries no out-of-range integers (reward ids/levels are small), so
-  // plain JSON.parse is exact here - the big-int-lossless path is only needed for the
-  // app's tick fields, which this catalog excludes.
-  return JSON.parse(plain.toString('utf8'));
-}
-
-/** Strip per-save state from a reward, keeping only the catalog (layout) fields. */
-function catalogReward(reward) {
-  return {
-    id: reward.id,
-    isPrestige: reward.isPrestige,
-    rewardType: reward.rewardType,
-    dataValInt: reward.dataValInt,
-    dataValString: reward.dataValString,
-    icon: reward.icon,
-    levelRequired: reward.levelRequired,
-  };
-}
+import { PATHS, readSource, writeOutput } from './lib/io.mjs';
+import { syntheticRewardId } from '../../src/domain/gamedata/seasonRewardId.ts';
 
 /** Read a single-line YAML scalar (`m_foo: bar`) from a ScriptableObject asset. */
 function assetField(text, field) {
-  return text.match(new RegExp(`^\\s*${field}:\\s*(.+?)\\s*$`, 'm'))?.[1] ?? null;
+  return text.match(new RegExp(`^\\s*${field}:[ \\t]*(.*?)[ \\t]*$`, 'm'))?.[1] ?? null;
 }
 
 /** Read the guid out of an inline asset reference (`m_foo: {fileID: …, guid: …, type: 2}`). */
 function assetRefGuid(text, field) {
   return text.match(new RegExp(`^\\s*${field}:\\s*\\{[^}]*guid:\\s*([0-9a-f]+)`, 'm'))?.[1] ?? null;
+}
+
+/**
+ * Read an ordered list of asset references:
+ *
+ *   m_foo:
+ *   - {fileID: 11400000, guid: abc…, type: 2}
+ *   - {fileID: 11400000, guid: def…, type: 2}
+ *
+ * Returns the guids in file order (`m_foo: []` and a missing field both give []).
+ */
+function assetRefList(text, field) {
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((l) => new RegExp(`^\\s*${field}:\\s*$`).test(l));
+  if (start === -1) return [];
+  const out = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    const m = lines[i].match(/^\s*-\s*\{[^}]*guid:\s*([0-9a-f]+)/);
+    if (!m) break;
+    out.push(m[1]);
+  }
+  return out;
 }
 
 /** Decode Unity's hex-encoded little-endian int32 array serialization. */
@@ -82,30 +84,40 @@ function guidIndex(prefix) {
   return out;
 }
 
-/**
- * Per-season static data from the v2.5.0 ScriptableObject layout. Season definitions
- * moved out of SeasonPassDataManager.prefab into per-season assets:
- *
- *   Season_<id>.asset          - m_id, m_endDateString, m_seasonDataSet {guid}
- *   SeasonDataSet_<name>.asset - m_tokenRequirements {guid}, m_passPurchaseRewardsDefID
- *   SeasonPassTokenRequirements_<name>.asset - m_data (hex-encoded LE int32 array)
- *   SeasonPassPurchaseRewards_<defID>.asset  - m_basePassTokens, m_premiumPassTokens
- *
- * Token costs are indexed by CURRENT level (SeasonPassTokenManager, clamped) - so
- * [0,3,5,6,6,10,…] means level 1→2 costs 3 tokens, 2→3 costs 5, and so on. End dates
- * are compared by the game against local DateTime.Now (+ the spd.dat debugTimeOffset);
- * the Season tab's "skip past end of season" needs them. Pass-purchase token grants
- * (verified v2.4.1-v2.5.0): 0 on the base (Premium) purchase, 25 on Premium Plus -
- * which levels a fresh pass straight to rank 5 (the in-game "instantly skips the
- * first levels" effect). Rerun seasons (NewVegasA_26_07, …) reference the original
- * season's purchase-rewards def and the shared Default token table.
- */
-function parseSeasonAssets() {
+/** One SeasonPassEntry asset -> a catalog reward (the id is attached by the caller). */
+function parseEntry(path) {
+  const text = readSource(path);
+  const num = (field) => {
+    const raw = assetField(text, field);
+    const n = Number(raw);
+    if (raw === null || raw === '' || !Number.isFinite(n))
+      throw new Error(`Season reward entry has no numeric ${field}:\n  ${path}`);
+    return n;
+  };
+  const rewardType = assetField(text, 'm_rewardType');
+  if (!rewardType) throw new Error(`Season reward entry has no m_rewardType:\n  ${path}`);
+  return {
+    isPrestige: num('m_isPrestige') === 1,
+    rewardType,
+    dataValInt: num('m_data_ValueInt'),
+    dataValString: assetField(text, 'm_data_ValueStr') ?? '',
+    icon: assetField(text, 'm_icon') ?? '',
+    levelRequired: num('m_levelRequired'),
+  };
+}
+
+export function buildSeasonPass() {
+  if (!existsSync(PATHS.monoBehaviourDir)) readSource(PATHS.monoBehaviourDir); // throws the standard message
+
   const dataSetByGuid = guidIndex('SeasonDataSet_');
   const tokenReqByGuid = guidIndex('SeasonPassTokenRequirements_');
+  const rewardsByGuid = guidIndex('SeasonPassRewards_');
+  const entryByGuid = guidIndex('SeasonPassEntry_');
 
   // Pass-purchase token grants, keyed by the def id in the asset name (the datasets
-  // reference them by m_passPurchaseRewardsDefID string, not by guid).
+  // reference them by m_passPurchaseRewardsDefID string, not by guid). Verified
+  // v2.4.1-v2.7.0: 0 on the base (Premium) purchase, 25 on Premium Plus - which levels a
+  // fresh pass straight to rank 5 against the token table.
   const passTokensByDefId = new Map();
   for (const f of readdirSync(PATHS.monoBehaviourDir)) {
     const m = f.match(/^SeasonPassPurchaseRewards_(\w+)\.asset$/);
@@ -117,78 +129,84 @@ function parseSeasonAssets() {
     });
   }
 
-  const out = new Map();
+  const seasons = [];
   for (const f of readdirSync(PATHS.monoBehaviourDir)) {
     if (!/^Season_\w+\.asset$/.test(f)) continue;
-    const season = readSource(join(PATHS.monoBehaviourDir, f));
+    const seasonPath = join(PATHS.monoBehaviourDir, f);
+    const season = readSource(seasonPath);
     const id = assetField(season, 'm_id');
     if (!id) continue;
 
-    let tokenRequirements = [];
-    let passTokens = { basePassTokens: 0, premiumPassTokens: 0 };
     const dataSetPath = dataSetByGuid.get(assetRefGuid(season, 'm_seasonDataSet'));
-    if (dataSetPath) {
-      const dataSet = readSource(dataSetPath);
-      const tokenReqPath = tokenReqByGuid.get(assetRefGuid(dataSet, 'm_tokenRequirements'));
-      if (tokenReqPath) {
-        tokenRequirements = decodeInt32Array(assetField(readSource(tokenReqPath), 'm_data') ?? '');
-      }
-      const defId = assetField(dataSet, 'm_passPurchaseRewardsDefID');
-      passTokens = passTokensByDefId.get(defId) ?? passTokens;
-    }
+    if (!dataSetPath)
+      throw new Error(`Season ${id} references no SeasonDataSet asset:\n  ${seasonPath}`);
+    const dataSet = readSource(dataSetPath);
 
-    out.set(id, {
-      endDate: assetField(season, 'm_endDateString') ?? undefined,
-      tokenRequirements,
-      ...passTokens,
-    });
-  }
-  return out;
-}
+    // Token costs are indexed by CURRENT level (SeasonPassTokenManager, clamped) - so
+    // [0,3,5,6,6,10,…] means level 1→2 costs 3 tokens, 2→3 costs 5, and so on.
+    const tokenReqPath = tokenReqByGuid.get(assetRefGuid(dataSet, 'm_tokenRequirements'));
+    const tokenRequirements = tokenReqPath
+      ? decodeInt32Array(assetField(readSource(tokenReqPath), 'm_data') ?? '')
+      : [];
+    const passTokens = passTokensByDefId.get(assetField(dataSet, 'm_passPurchaseRewardsDefID')) ?? {
+      basePassTokens: 0,
+      premiumPassTokens: 0,
+    };
 
-export function buildSeasonPass() {
-  if (!existsSync(REFERENCE_SPD)) {
-    throw new Error(
-      `Missing Season Pass source:\n  ${REFERENCE_SPD}\n` +
-        'build-season-pass needs a reference spd.dat at the repo root (a real season-pass\n' +
-        'save, gitignored like every .dat/.sav). The committed public/gamedata/season-pass.json\n' +
-        'already ships the derived catalog - you only need this file to regenerate it when the\n' +
-        'game adds seasons.',
-    );
-  }
+    // Rerun seasons may point at the ORIGINAL season's reward list (v2.7.0:
+    // UltraciteFever_27_03 shares UltraciteFever's) - the list is resolved per season, and
+    // each season still gets its own ids because the id is derived from the season id.
+    const rewardsPath = rewardsByGuid.get(assetRefGuid(dataSet, 'm_SeasonPassRewards'));
+    if (!rewardsPath)
+      throw new Error(`Season ${id} references no SeasonPassRewards asset:\n  ${dataSetPath}`);
+    const rewardsText = readSource(rewardsPath);
+    const track = (field, trackName) =>
+      assetRefList(rewardsText, field).map((guid, index) => {
+        const entryPath = entryByGuid.get(guid);
+        if (!entryPath)
+          throw new Error(
+            `Season ${id} ${trackName}[${index}] references an unknown entry ${guid}`,
+          );
+        return { id: syntheticRewardId(id, trackName, index), ...parseEntry(entryPath) };
+      });
+    const freeRewards = track('m_freeRewards', 'free');
+    const premiumRewards = track('m_premiumRewards', 'premium');
+    if (freeRewards.length === 0 || premiumRewards.length === 0)
+      throw new Error(
+        `Season ${id} parsed an empty reward track - the asset layout changed:\n  ${rewardsPath}`,
+      );
 
-  const spd = decodeContainer(readFileSync(REFERENCE_SPD, 'utf8'));
-  const seasonsData = spd.seasonsData ?? {};
-  const seasonAssets = parseSeasonAssets();
-
-  // The inert ncqReward placeholder is identical across all seasons; emit one template
-  // (claim state stripped) for the fresh-model builder to attach per season.
-  const sampleRecord = Object.values(seasonsData)[0];
-  const ncqReward = sampleRecord?.ncqReward ? catalogReward(sampleRecord.ncqReward) : null;
-
-  const seasons = Object.entries(seasonsData).map(([id, record]) => {
-    const freeRewards = (record.freeRewardsList ?? []).map(catalogReward);
-    const premiumRewards = (record.premiumRewardsList ?? []).map(catalogReward);
     // The season's rank cap is the highest level gate across both tracks (premium runs
     // 1..25 in every shipped season; prestige rewards are the last 5 premium ranks).
     const maxRank = [...freeRewards, ...premiumRewards].reduce(
       (m, r) => Math.max(m, r.levelRequired),
       0,
     );
-    const assets = seasonAssets.get(id);
-    return {
+    const startDate = assetField(season, 'm_startDateString') || undefined;
+    const endDate = assetField(season, 'm_endDateString') || undefined;
+    seasons.push({
       id,
       maxRank,
-      tokenRequirements: assets?.tokenRequirements ?? [],
-      basePassTokens: assets?.basePassTokens ?? 0,
-      premiumPassTokens: assets?.premiumPassTokens ?? 0,
-      ...(assets?.endDate !== undefined ? { endDate: assets.endDate } : {}),
+      tokenRequirements,
+      ...passTokens,
+      ...(startDate !== undefined ? { startDate } : {}),
+      // End dates are compared by the game against local DateTime.Now (+ the spd.dat
+      // debugTimeOffset); the Season tab's "skip past end of season" needs them.
+      ...(endDate !== undefined ? { endDate } : {}),
       freeRewards,
       premiumRewards,
-    };
-  });
+    });
+  }
 
-  return { ncqReward, seasons };
+  // Chronological - the order the game itself lists them in spd.dat's seasonsData.
+  seasons.sort(
+    (a, b) => (a.startDate ?? '').localeCompare(b.startDate ?? '') || a.id.localeCompare(b.id),
+  );
+
+  // `ncqReward` was an inert per-season placeholder in pre-v2.7.0 files. The v2.7.0 game
+  // no longer writes it for new seasons and there is no asset for it, so the catalog
+  // carries none; files that still have one round-trip it untouched.
+  return { ncqReward: null, seasons };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

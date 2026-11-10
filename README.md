@@ -61,8 +61,11 @@ The editor is organized into sections, each backed by undo/redo and live save-he
   more), room operations, unlocks, and location loadouts.
 - **Season Pass**: load the game's season files (`spd.dat` / `nvf.dat`) to view the reward
   track and claim or unclaim rewards, up to maxing out every season - including the rerun
-  seasons introduced in game v2.5.0. Claims are tracked per vault slot, auto-matched to the
-  loaded `Vault<N>.sav` (overridable), so a seasonal vault's board shows its own claim state.
+  seasons introduced in game v2.5.0. Reads and writes both season file formats: the older
+  one, and the game v2.7.0 one where the file only keeps claim state and the reward
+  details come from the editor's game-data catalog. Claims are tracked per vault slot,
+  auto-matched to the loaded `Vault<N>.sav` (overridable), so a seasonal vault's board shows
+  its own claim state.
   A season clock card drives the game's own debug offset (+days, skip past the season end,
   reset).
 - **Advanced**: a CodeMirror JSON IDE with an explorer tree and a live diff against the

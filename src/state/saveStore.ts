@@ -15,6 +15,7 @@ import {
   buildFreshSeasonSave,
   claimIndexFromSaveFileName,
   loadSeasonSave,
+  dehydrateSeasonSave,
   type ReversalHandles,
   type SeasonWorkspace,
 } from '../domain/ops/seasonOps.ts';
@@ -150,7 +151,12 @@ export interface SaveState {
   /** Build a fresh, editable season model from the static catalog ("Continue without a file"). */
   startSeasonFromCatalog: (catalog: SeasonCatalog) => void;
   /** Load an uploaded `spd.dat` (and optional `nvf.dat`) into the season working model. */
-  loadSeasonFromText: (spdText: string, nvfText: string | null, fileName: string) => Promise<void>;
+  loadSeasonFromText: (
+    spdText: string,
+    nvfText: string | null,
+    fileName: string,
+    catalog?: SeasonCatalog | null,
+  ) => Promise<void>;
   /** Override the vault-slot claim index (the Season tab's "Claims for Vault N" control). */
   setSeasonClaimIndex: (index: number) => void;
   /** Encode the current `spd.dat` working model to container text. */
@@ -365,8 +371,9 @@ export const useSaveStore = create<SaveState>((set, get) => ({
     });
   },
 
-  loadSeasonFromText: async (spdText, nvfText, fileName) => {
-    const spd = loadSeasonSave(await decodeSeason(spdText));
+  loadSeasonFromText: async (spdText, nvfText, fileName, catalog = null) => {
+    // The catalog hydrates v2.7.0 positional rewards (the file no longer says what they are).
+    const spd = loadSeasonSave(await decodeSeason(spdText), catalog);
     const nvf = nvfText
       ? await decodeNvf(nvfText)
       : ({ season: { id: spd.currentSeason ?? '', type: 0 } } satisfies NvfData);
@@ -388,7 +395,8 @@ export const useSaveStore = create<SaveState>((set, get) => ({
   exportSeasonText: async () => {
     const { seasonSave } = get();
     if (!seasonSave) throw new Error('No season data loaded.');
-    return encodeSeason(seasonSave);
+    // Back to the on-disk shape: catalog-filled reward fields never reach the file.
+    return encodeSeason(dehydrateSeasonSave(seasonSave));
   },
 
   exportNvfText: async () => {

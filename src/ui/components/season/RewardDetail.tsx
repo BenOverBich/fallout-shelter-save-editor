@@ -1,4 +1,4 @@
-import type { SeasonReward } from '../../../domain/model/seasonSchema.ts';
+import { HYDRATED_REWARD_MARK, type SeasonReward } from '../../../domain/model/seasonSchema.ts';
 import type { GameData } from '../../../domain/gamedata/gameData.ts';
 import { isRewardClaimed, type SeasonTrack } from '../../../domain/ops/seasonOps.ts';
 import { ItemIcon } from '../ItemIcon.tsx';
@@ -98,7 +98,8 @@ export function RewardDetail({
               <Field label="Quantity" value={Math.trunc(reward.dataValInt).toLocaleString()} />
             )}
             {reward.dataValString && <Field label="Item code" value={reward.dataValString} />}
-            <Field label="Reward id" value={reward.id} />
+            {/* v2.7.0 rewards have no id in the file (positional); only show a real one. */}
+            {reward[HYDRATED_REWARD_MARK] !== true && <Field label="Reward id" value={reward.id} />}
           </dl>
         </div>
 

@@ -10,9 +10,9 @@ import { assetUrl } from './assetBase.ts';
 // from the core GameData bundle because only the lazy-loaded Season tab needs it.
 
 export interface SeasonCatalog {
-  /** Inert `ncqReward` placeholder template (claim state stripped), or null if absent. */
+  /** Inert `ncqReward` placeholder template from pre-v2.7.0 catalogs; null from v2.7.0 on. */
   ncqReward: SeasonPassCatalog['ncqReward'];
-  /** Seasons in catalog order (== the order they appear in the reference spd.dat). */
+  /** Seasons in catalog order: chronological by start date, as the game lists them. */
   seasons: SeasonCatalogEntry[];
   /** Season ids in catalog order - the season switcher's pill order. */
   seasonIds: string[];

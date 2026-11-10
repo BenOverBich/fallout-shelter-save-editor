@@ -297,6 +297,8 @@ const seasonCatalogEntrySchema = z.object({
   /** Scheduled season end date ("YYYY-MM-DD", from SeasonPassDataManager.prefab); the game
    *  compares it against local time + the spd.dat debugTimeOffset. Absent when unknown. */
   endDate: z.string().optional(),
+  /** Scheduled season start date ("YYYY-MM-DD", Season_<id>.asset). Absent when unknown. */
+  startDate: z.string().optional(),
   freeRewards: z.array(catalogRewardSchema),
   premiumRewards: z.array(catalogRewardSchema),
 });
